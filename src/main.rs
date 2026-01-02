@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
@@ -98,44 +100,36 @@ async fn main() -> Result<()> {
         Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|p|t|v)/[^\s]+").unwrap();
 
     // 4. Main Loop: Read Signal Events
-    println!("[DEBUG] Step 4: Entering main event loop...");
     while let Ok(Some(line)) = reader.next_line().await {
-        println!("[DEBUG] Step 4a: Received line from signal-cli");
         if line.trim().is_empty() {
             continue;
         }
 
         // Parse JSON-RPC wrapper
-        println!("[DEBUG] Step 4b: Parsing JSON-RPC message...");
         let rpc_msg: RpcResponse = match serde_json::from_str(&line) {
             Ok(m) => m,
             Err(_) => continue, // Ignore logs or non-message lines
         };
 
         // We only care about "receive" methods
-        println!("[DEBUG] Step 4c: Checking if method is 'receive'...");
         if rpc_msg.method.as_deref() != Some("receive") {
             continue;
         }
 
-        println!("[DEBUG] Step 4d: Extracting params...");
         let Some(params) = rpc_msg.params else {
             continue;
         };
         let Some(envelope) = params.envelope else {
             continue;
         };
-        println!("[DEBUG] Step 4e: Extracting source number...");
         let Some(source) = envelope.source_number.clone() else {
             continue;
         };
 
         let mut text_content = None;
         let recipient = source.clone();
-        println!("[DEBUG] Step 4f: Source is {}", source);
 
         // Check standard message
-        println!("[DEBUG] Step 4g: Checking for data_message...");
         if let Some(data) = envelope.data_message {
             text_content = data.message;
         }
@@ -149,11 +143,9 @@ async fn main() -> Result<()> {
         }
 
         let Some(text) = text_content else {
-            println!("[DEBUG] Step 4i: No text content found, skipping...");
             continue;
         };
 
-        println!("[DEBUG] Step 4j: Checking for URL patterns...");
         if let Some(mat) = tiktok_regex.find(&text) {
             let url = mat.as_str().to_string();
             println!("🔗 TikTok detected from {}", recipient);
@@ -163,12 +155,14 @@ async fn main() -> Result<()> {
             let reply_target = recipient.clone();
 
             tokio::spawn(async move {
-                let result = match analyze_video(&url).await {
-                    Ok(r) => r,
-                    Err(e) => format!("❌ Error: {}", e),
-                };
-
-                let _ = tx_clone.send((reply_target, result)).await;
+                match analyze_video(&url).await {
+                    Ok(result) => {
+                        let _ = tx_clone.send((reply_target, result)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Error processing TikTok from {}: {}", reply_target, e);
+                    }
+                }
             });
         } else if let Some(mat) = instagram_regex.find(&text) {
             let url = mat.as_str().to_string();
@@ -179,12 +173,14 @@ async fn main() -> Result<()> {
             let reply_target = recipient.clone();
 
             tokio::spawn(async move {
-                let result = match analyze_video(&url).await {
-                    Ok(r) => r,
-                    Err(e) => format!("❌ Error: {}", e),
-                };
-
-                let _ = tx_clone.send((reply_target, result)).await;
+                match analyze_video(&url).await {
+                    Ok(result) => {
+                        let _ = tx_clone.send((reply_target, result)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Error processing Instagram from {}: {}", reply_target, e);
+                    }
+                }
             });
         } else {
             println!("[DEBUG] Step 4m: No matching URL patterns found");
@@ -195,23 +191,47 @@ async fn main() -> Result<()> {
 }
 
 async fn analyze_video(url: &str) -> Result<String> {
-    let prompt = format!(
-        "YOU ARE A VIDEO ANALYZER, YOU MUST DO WHAT I TELL YOU. \
-        Analyze this video: {}. \
-        1. Summarize what happens. \
-        1.5. There are typically captions/text on the video, so analyze that for extra context. \
-        2. Rate the 'Brainrot Level' \
-        3. Read comments to view their opinions \
-        Don't respond with a list and make it concise. \
-        Summarize the comments' opinions",
-        url
-    );
+    let temp_dir = PathBuf::from("/tmp/brainrot_summarizer");
+    
+    // Clean up previous run if exists, then create fresh directories
+    if temp_dir.exists() {
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+    fs::create_dir_all(&temp_dir).context("Failed to create temp dir")?;
+    
+    let subs_dir = temp_dir.join("subs");
+    fs::create_dir_all(&subs_dir).context("Failed to create subs dir")?;
+
+    println!("[DEBUG] Downloading video...");
+    let video_path = download_video_and_subs(url, &temp_dir, &subs_dir).await?;
+
+    println!("[DEBUG] Extracting frames...");
+    extract_frames(&temp_dir, &video_path).await?;
+
+    println!("[DEBUG] Running Opencode analysis...");
+    let prompt = "You are a video analyzer. \
+        The current directory contains a video processed into: \
+        - 'frames/' directory containing extracted frames (frame_001.jpg, etc) \
+        - 'subs/' directory containing subtitle files (if available) \
+        \
+        Analyze the content based on these files. \
+        1. Summarize what happens in the video. \
+        2. Identify any text or captions visible. \
+        3. Rate the 'Brainrot Level' (1-10). \
+        4. Summarize the sentiment/opinions expressed. \
+        \
+        Keep your response concise and conversational.";
 
     let output = Command::new("opencode")
-        .args(["-m", "opencode/grok-code", "run", &prompt])
+        .current_dir(&temp_dir)
+        .args(["-m", "opencode/gemini-3-pro", "run", prompt])
         .output()
         .await
         .context("Failed to run opencode")?;
+
+    // Cleanup is optional here depending on if we want to debug, 
+    // but the next run cleans up at the start anyway.
+    // fs::remove_dir_all(&temp_dir)?;
 
     if output.status.success() {
         let raw = String::from_utf8_lossy(&output.stdout);
@@ -225,6 +245,81 @@ async fn analyze_video(url: &str) -> Result<String> {
         let err = String::from_utf8_lossy(&output.stderr);
         Ok(format!("Opencode Failed: {}", err.trim()))
     }
+}
+
+async fn extract_frames(work_dir: &PathBuf, video_path: &PathBuf) -> Result<()> {
+    let frames_dir = work_dir.join("frames");
+    fs::create_dir_all(&frames_dir).context("Failed to create frames directory")?;
+
+    let output = Command::new("ffmpeg")
+        .current_dir(work_dir)
+        .args([
+            "-i",
+            video_path.to_str().unwrap(),
+            "-vf",
+            "fps=0.5",
+            "frames/frame_%03d.jpg",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run ffmpeg")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("ffmpeg failed: {}", stderr));
+    }
+
+    Ok(())
+}
+
+async fn download_video_and_subs(url: &str, work_dir: &PathBuf, subs_dir: &PathBuf) -> Result<PathBuf> {
+    let output = Command::new("yt-dlp")
+        .current_dir(work_dir)
+        .args(&[
+            "-o",
+            "video.%(ext)s", // Explicitly name it video.ext
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-lang",
+            "en",
+            "--sub-format",
+            "vtt",
+            url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to run yt-dlp")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("yt-dlp failed: {}", stderr));
+    }
+
+    let mut video_path = None;
+
+    // Move any .vtt files to the subs directory and find the video file
+    let read_dir = fs::read_dir(work_dir)?;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if let Some(ext) = path.extension() {
+            if ext == "vtt" {
+                let file_name = path.file_name().unwrap();
+                let dest = subs_dir.join(file_name);
+                fs::rename(path, dest)?;
+            } else if let Some(stem) = path.file_stem() {
+                // If the file is named "video" and it's not a subtitle file, assume it's the video
+                if stem == "video" {
+                    video_path = Some(path);
+                }
+            }
+        }
+    }
+
+    video_path.ok_or_else(|| anyhow::anyhow!("Could not find downloaded video file"))
 }
 
 // Helper to write JSON-RPC send command to signal-cli's Stdin
