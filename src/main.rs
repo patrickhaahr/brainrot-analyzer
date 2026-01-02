@@ -300,6 +300,7 @@ async fn download_video_and_subs(url: &str, work_dir: &PathBuf, subs_dir: &PathB
     }
 
     let mut video_path = None;
+    let mut found_subs = false;
 
     // Move any .vtt files to the subs directory and find the video file
     let read_dir = fs::read_dir(work_dir)?;
@@ -310,6 +311,7 @@ async fn download_video_and_subs(url: &str, work_dir: &PathBuf, subs_dir: &PathB
                 let file_name = path.file_name().unwrap();
                 let dest = subs_dir.join(file_name);
                 fs::rename(path, dest)?;
+                found_subs = true;
             } else if let Some(stem) = path.file_stem() {
                 // If the file is named "video" and it's not a subtitle file, assume it's the video
                 if stem == "video" {
@@ -319,7 +321,34 @@ async fn download_video_and_subs(url: &str, work_dir: &PathBuf, subs_dir: &PathB
         }
     }
 
-    video_path.ok_or_else(|| anyhow::anyhow!("Could not find downloaded video file"))
+    let video_path = video_path.ok_or_else(|| anyhow::anyhow!("Could not find downloaded video file"))?;
+
+    if !found_subs {
+        println!("[DEBUG] No subtitles found by yt-dlp. Running Whisper fallback...");
+        let output = Command::new("whisper")
+            .arg(video_path.to_str().unwrap())
+            .arg("--model")
+            .arg("tiny")
+            .arg("--output_format")
+            .arg("vtt")
+            .arg("--output_dir")
+            .arg(subs_dir.to_str().unwrap())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context("Failed to run whisper")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("Warning: Whisper failed: {}", stderr);
+            // We proceed without subtitles rather than failing the whole download
+        } else {
+            println!("[DEBUG] Whisper generated subtitles successfully.");
+        }
+    }
+
+    Ok(video_path)
 }
 
 // Helper to write JSON-RPC send command to signal-cli's Stdin
