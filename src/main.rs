@@ -24,6 +24,8 @@ struct RpcParams {
 struct Envelope {
     #[serde(rename = "sourceNumber")]
     source_number: Option<String>,
+    #[serde(rename = "sourceUuid")]
+    source_uuid: Option<String>,
     #[serde(rename = "dataMessage")]
     data_message: Option<DataMessage>,
     #[serde(rename = "syncMessage")]
@@ -100,51 +102,101 @@ async fn main() -> Result<()> {
         Regex::new(r"https?://(?:www\.)?instagram\.com/(?:reel|p|t|v)/[^\s]+").unwrap();
 
     // 4. Main Loop: Read Signal Events
+    println!("[DEBUG] Entering main event loop, waiting for messages...");
     while let Ok(Some(line)) = reader.next_line().await {
         if line.trim().is_empty() {
             continue;
         }
 
+        // Debug: Print raw JSON (truncated for readability)
+        let preview = if line.len() > 300 {
+            &line[..300]
+        } else {
+            &line
+        };
+        println!("[DEBUG] Raw JSON: {}...", preview);
+
         // Parse JSON-RPC wrapper
         let rpc_msg: RpcResponse = match serde_json::from_str(&line) {
             Ok(m) => m,
-            Err(_) => continue, // Ignore logs or non-message lines
+            Err(e) => {
+                if line.trim().starts_with('{') {
+                    println!("[DEBUG] JSON parse error: {}", e);
+                }
+                continue;
+            }
         };
 
         // We only care about "receive" methods
-        if rpc_msg.method.as_deref() != Some("receive") {
+        let method = rpc_msg.method.as_deref();
+        if method != Some("receive") {
+            println!("[DEBUG] Skipping method: {:?}", method);
             continue;
         }
 
         let Some(params) = rpc_msg.params else {
+            println!("[DEBUG] No params in message");
             continue;
         };
         let Some(envelope) = params.envelope else {
+            println!("[DEBUG] No envelope in params");
             continue;
         };
-        let Some(source) = envelope.source_number.clone() else {
+
+        // Get source identifier - prefer phone number, fallback to UUID
+        let source = envelope
+            .source_number
+            .clone()
+            .or_else(|| envelope.source_uuid.clone());
+
+        let Some(source) = source else {
+            println!("[DEBUG] No sourceNumber or sourceUuid in envelope");
             continue;
         };
+
+        println!("[DEBUG] Message from source: {}", source);
+        println!(
+            "[DEBUG] Has dataMessage: {}",
+            envelope.data_message.is_some()
+        );
+        println!(
+            "[DEBUG] Has syncMessage: {}",
+            envelope.sync_message.is_some()
+        );
 
         let mut text_content = None;
         let recipient = source.clone();
 
-        // Check standard message
-        if let Some(data) = envelope.data_message {
-            text_content = data.message;
+        // Check standard message (from others)
+        if let Some(ref data) = envelope.data_message {
+            println!("[DEBUG] dataMessage.message: {:?}", data.message);
+            text_content = data.message.clone();
         }
         // Check "Note to Self" (Sync)
-        else if let Some(sync) = envelope.sync_message {
-            if let Some(sent) = sync.sent_message {
+        else if let Some(ref sync) = envelope.sync_message {
+            if let Some(ref sent) = sync.sent_message {
+                println!(
+                    "[DEBUG] syncMessage.sentMessage.destination: {:?}",
+                    sent.destination
+                );
+                println!(
+                    "[DEBUG] syncMessage.sentMessage.message: {:?}",
+                    sent.message
+                );
                 if sent.destination == Some(source.clone()) {
-                    text_content = sent.message;
+                    text_content = sent.message.clone();
                 }
+            } else {
+                println!("[DEBUG] syncMessage has no sentMessage");
             }
         }
 
         let Some(text) = text_content else {
+            println!("[DEBUG] No text content extracted, skipping");
             continue;
         };
+
+        println!("[DEBUG] Extracted text: {}", &text[..text.len().min(100)]);
 
         if let Some(mat) = tiktok_regex.find(&text) {
             let url = mat.as_str().to_string();
@@ -192,13 +244,13 @@ async fn main() -> Result<()> {
 
 async fn analyze_video(url: &str) -> Result<String> {
     let temp_dir = PathBuf::from("/tmp/brainrot_summarizer");
-    
+
     // Clean up previous run if exists, then create fresh directories
     if temp_dir.exists() {
         let _ = fs::remove_dir_all(&temp_dir);
     }
     fs::create_dir_all(&temp_dir).context("Failed to create temp dir")?;
-    
+
     let subs_dir = temp_dir.join("subs");
     fs::create_dir_all(&subs_dir).context("Failed to create subs dir")?;
 
@@ -215,21 +267,20 @@ async fn analyze_video(url: &str) -> Result<String> {
         - 'subs/' directory containing subtitle files (if available) \
         \
         Analyze the content based on these files. \
-        1. Summarize what happens in the video. \
-        2. Identify any text or captions visible. \
+        1. Summarize what happens in the video. Include text and captions \
+        2. Summarize the sentiment/opinions expressed. \
         3. Rate the 'Brainrot Level' (1-10). \
-        4. Summarize the sentiment/opinions expressed. \
-        \
-        Keep your response concise and conversational.";
+        Natural formatting, no '*', keep Headings \
+        Keep your response CONCISE and conversational.";
 
     let output = Command::new("opencode")
         .current_dir(&temp_dir)
-        .args(["-m", "opencode/gemini-3-pro", "run", prompt])
+        .args(["-m", "opencode/gemini-3-flash", "run", prompt])
         .output()
         .await
         .context("Failed to run opencode")?;
 
-    // Cleanup is optional here depending on if we want to debug, 
+    // Cleanup is optional here depending on if we want to debug,
     // but the next run cleans up at the start anyway.
     // fs::remove_dir_all(&temp_dir)?;
 
@@ -274,7 +325,11 @@ async fn extract_frames(work_dir: &PathBuf, video_path: &PathBuf) -> Result<()> 
     Ok(())
 }
 
-async fn download_video_and_subs(url: &str, work_dir: &PathBuf, subs_dir: &PathBuf) -> Result<PathBuf> {
+async fn download_video_and_subs(
+    url: &str,
+    work_dir: &PathBuf,
+    subs_dir: &PathBuf,
+) -> Result<PathBuf> {
     let output = Command::new("yt-dlp")
         .current_dir(work_dir)
         .args(&[
@@ -321,7 +376,8 @@ async fn download_video_and_subs(url: &str, work_dir: &PathBuf, subs_dir: &PathB
         }
     }
 
-    let video_path = video_path.ok_or_else(|| anyhow::anyhow!("Could not find downloaded video file"))?;
+    let video_path =
+        video_path.ok_or_else(|| anyhow::anyhow!("Could not find downloaded video file"))?;
 
     if !found_subs {
         println!("[DEBUG] No subtitles found by yt-dlp. Running Whisper fallback...");
