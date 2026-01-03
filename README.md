@@ -9,3 +9,5 @@ remove debug logs
 
 make feature to send signal message always to note to self rather than the recipent - toggle?
 
+github action - automate release binary file 
+
