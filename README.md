@@ -3,7 +3,7 @@ dockerfile, docker compose
 easy model switch - .env 
 prompt switch? - .env
 proper readme guide:
-  * prereqs: rust, signal-lib, opencode (auth login), signal-cli (register or link), java-jre21
+  * prereqs: rust, signal-lib, opencode (auth login), signal-cli (register or link), java-jre21, openai-whisper, yt-dlp
 
 remove debug logs
 
