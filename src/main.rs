@@ -267,11 +267,14 @@ async fn analyze_video(url: &str) -> Result<String> {
         - 'subs/' directory containing subtitle files (if available) \
         \
         Analyze the content based on these files. \
-        1. Summarize what happens in the video. Include text and captions \
+        1. Summarize what happens. Text and captions are important for the context \
         2. Summarize the sentiment/opinions expressed. \
         3. Rate the 'Brainrot Level' (1-10). \
-        Natural formatting, no '*', keep Headings \
-        Keep your response CONCISE and conversational.";
+        Natural formatting, no '*', keep Headings. START output from 'Summary' \
+        Keep your response CONCISE \
+        No more than 3-4 sentances of Summary \
+        No more than 2-3 sentances of sentiment and opinions \
+        No more than 1 sentance";
 
     let output = Command::new("opencode")
         .current_dir(&temp_dir)
