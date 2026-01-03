@@ -1,0 +1,16 @@
+[Unit]
+Description=Brainrot Summarizer - Signal Video Analyzer
+After=network.target
+
+[Service]
+Type=simple
+User=
+WorkingDirectory=
+ExecStart=/usr/local/bin/brainrot
+Restart=always
+RestartSec=10
+Environment="JAVA_OPTS=-Djava.library.path=/path/to/libsignal/target/release"
+Environment="PATH=/home/USER/.local/bin:/home/USER/.cargo/bin:/home/USER/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[Install]
+WantedBy=multi-user.target
